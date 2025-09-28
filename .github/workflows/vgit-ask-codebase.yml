@@ -1,0 +1,343 @@
+name: VGit Ask Codebase
+on:
+  workflow_dispatch:
+    inputs:
+      question:
+        description: "Question about the codebase"
+        required: true
+        type: string
+      commit_sha:
+        description: "Commit to checkout"
+        required: true
+        type: string
+      context_node:
+        description: "Current workspace node for context"
+        required: false
+        type: string
+
+jobs:
+  ask-codebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write       # For repository checkout and file writing
+      id-token: write       # For Claude Code action OIDC authentication
+      actions: read         # For workflow operations
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.question }}" ]; then
+            echo "❌ Question is required"
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+          echo "Question: ${{ github.event.inputs.question }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Analyze repository structure
+        run: |
+          echo "🔍 Analyzing repository structure..."
+
+          # Get basic project info
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+
+          # Check if it's a Node.js project
+          if [ -f "package.json" ]; then
+            echo "📦 Node.js project detected"
+            echo "FRAMEWORK=nodejs" >> $GITHUB_ENV
+            
+            # Extract project info from package.json
+            PROJECT_DESCRIPTION=$(jq -r '.description // ""' package.json)
+            MAIN_FILE=$(jq -r '.main // ""' package.json)
+            
+            echo "Description: $PROJECT_DESCRIPTION"
+            echo "Main File: $MAIN_FILE"
+            
+            # Check for common frameworks
+            if jq -e '.dependencies.react' package.json > /dev/null 2>&1; then
+              echo "⚛️ React project detected"
+              echo "FRAMEWORK=react" >> $GITHUB_ENV
+            elif jq -e '.dependencies.vue' package.json > /dev/null 2>&1; then
+              echo "🟢 Vue project detected"  
+              echo "FRAMEWORK=vue" >> $GITHUB_ENV
+            elif jq -e '.dependencies.angular' package.json > /dev/null 2>&1; then
+              echo "🅰️ Angular project detected"
+              echo "FRAMEWORK=angular" >> $GITHUB_ENV
+            elif jq -e '.dependencies.express' package.json > /dev/null 2>&1; then
+              echo "🚀 Express project detected"
+              echo "FRAMEWORK=express" >> $GITHUB_ENV
+            fi
+          else
+            echo "ℹ️ No package.json found, analyzing as generic project"
+            echo "FRAMEWORK=generic" >> $GITHUB_ENV
+          fi
+
+      - name: Generate project overview
+        run: |
+          echo "📊 Generating project overview..."
+
+          # Count files by type
+          echo "📁 File Analysis:"
+          find . -type f -name "*.js" | wc -l | xargs echo "JavaScript files:"
+          find . -type f -name "*.ts" | wc -l | xargs echo "TypeScript files:"
+          find . -type f -name "*.jsx" | wc -l | xargs echo "JSX files:"
+          find . -type f -name "*.tsx" | wc -l | xargs echo "TSX files:"
+          find . -type f -name "*.css" | wc -l | xargs echo "CSS files:"
+          find . -type f -name "*.scss" | wc -l | xargs echo "SCSS files:"
+          find . -type f -name "*.json" | wc -l | xargs echo "JSON files:"
+          find . -type f -name "*.md" | wc -l | xargs echo "Markdown files:"
+
+          # Generate directory structure (limited depth to avoid noise)
+          echo ""
+          echo "🌳 Directory Structure:"
+          if command -v tree >/dev/null 2>&1; then
+            tree -I 'node_modules|.git|dist|build|coverage' -L 3
+          else
+            find . -type d \( -name node_modules -o -name .git -o -name dist -o -name build \) -prune -o -type d -print | head -20
+          fi
+
+      - name: Extract key files content
+        run: |
+          echo "📄 Extracting key files content..."
+
+          # Create directory for extracted content
+          mkdir -p analysis_context
+
+          # Extract key configuration files
+          KEY_FILES=(
+            "package.json"
+            "tsconfig.json"
+            "vite.config.js"
+            "vite.config.ts"
+            "webpack.config.js"
+            "next.config.js"
+            "README.md"
+            "src/index.js"
+            "src/index.ts"
+            "src/main.js"
+            "src/main.ts"
+            "src/App.js"
+            "src/App.tsx"
+            "src/App.vue"
+            "index.html"
+          )
+
+          for file in "${KEY_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ Found: $file"
+              {
+                echo "--- $file ---"
+                head -n 100 "$file"  # Limit to first 100 lines
+                if [ $(wc -l < "$file") -gt 100 ]; then
+                  echo "... (truncated - file has $(wc -l < "$file") total lines)"
+                fi
+                echo ""
+              } >> analysis_context/key_files.txt
+            fi
+          done
+
+      - name: Analyze code patterns
+        run: |
+          echo "🔍 Analyzing code patterns..."
+
+          # Look for common patterns and imports
+          echo "📦 Dependencies Analysis:" > analysis_context/patterns.txt
+
+          if [ -f "package.json" ]; then
+            echo "Dependencies:" >> analysis_context/patterns.txt
+            jq -r '.dependencies // {} | keys[]' package.json | head -10 >> analysis_context/patterns.txt
+            
+            echo "" >> analysis_context/patterns.txt
+            echo "Dev Dependencies:" >> analysis_context/patterns.txt  
+            jq -r '.devDependencies // {} | keys[]' package.json | head -10 >> analysis_context/patterns.txt
+          fi
+
+          # Find common code patterns
+          echo "" >> analysis_context/patterns.txt
+          echo "🔧 Code Patterns:" >> analysis_context/patterns.txt
+
+          # Count component files
+          COMPONENT_COUNT=$(find . -name "*.jsx" -o -name "*.tsx" -o -name "*.vue" | grep -v node_modules | wc -l)
+          echo "Components: $COMPONENT_COUNT files" >> analysis_context/patterns.txt
+
+          # Count API/service files  
+          API_COUNT=$(find . -path "*/api/*" -o -path "*/services/*" -o -name "*service*" -o -name "*api*" | grep -v node_modules | wc -l)
+          echo "API/Services: $API_COUNT files" >> analysis_context/patterns.txt
+
+          # Count test files
+          TEST_COUNT=$(find . -name "*.test.*" -o -name "*.spec.*" -o -path "*/test/*" -o -path "*/tests/*" | grep -v node_modules | wc -l)
+          echo "Tests: $TEST_COUNT files" >> analysis_context/patterns.txt
+
+      - name: Prepare analysis context
+        run: |
+          echo "📝 Preparing comprehensive analysis context..."
+
+          # Create comprehensive context file
+          cat > analysis_context/full_context.md << 'EOF'
+          # Codebase Analysis Context
+
+          ## Project Information
+          - Repository: ${{ github.repository }}
+          - Framework: ${{ env.FRAMEWORK }}
+          - Question: "${{ github.event.inputs.question }}"
+
+          ## Repository Statistics
+          EOF
+
+          # Add repository stats
+          echo "- Total files: $(find . -type f | grep -v '.git' | wc -l)" >> analysis_context/full_context.md
+          echo "- Total directories: $(find . -type d | grep -v '.git' | wc -l)" >> analysis_context/full_context.md
+          echo "- Repository size: $(du -sh . | cut -f1)" >> analysis_context/full_context.md
+
+          # Append other analysis files
+          if [ -f "analysis_context/key_files.txt" ]; then
+            echo "" >> analysis_context/full_context.md
+            echo "## Key Files Content" >> analysis_context/full_context.md
+            cat analysis_context/key_files.txt >> analysis_context/full_context.md
+          fi
+
+          if [ -f "analysis_context/patterns.txt" ]; then
+            echo "" >> analysis_context/full_context.md
+            echo "## Code Patterns and Dependencies" >> analysis_context/full_context.md
+            cat analysis_context/patterns.txt >> analysis_context/full_context.md
+          fi
+
+      - name: Analyze codebase with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          settings: |
+            {
+              "permissions": {
+                "allow": [
+                  "Read(*)",
+                  "Edit(*)",
+                  "Glob(*)",
+                  "Grep(*)",
+                  "Write(*)"
+                ]
+              }
+            }
+          claude_args: |
+            --allowedTools Edit,Read,Write,Glob,Grep
+          prompt: |
+            I have a question about this codebase. Please analyze the code and provide a detailed answer.
+
+            **Question:** ${{ github.event.inputs.question }}
+
+            **Repository Context:**
+            - Repository: ${{ github.repository }}
+            - Framework: ${{ env.FRAMEWORK }}
+            - Question: "${{ github.event.inputs.question }}"
+
+            Please provide a comprehensive answer that:
+            1. Directly addresses the question with specific details
+            2. References specific files, functions, or code sections when relevant
+            3. Explains the implementation details and architecture
+            4. Provides code examples or snippets if helpful
+            5. Suggests improvements or best practices if applicable
+            6. Considers the project's framework and dependencies
+
+            Your answer should be informative, actionable, and tailored to this specific codebase.
+            Analyze the codebase and answer the following question: ${{ github.event.inputs.question }}
+
+            You are working on a project in the current directory. Please:
+            1. Analyze the existing codebase structure and patterns
+            2. Provide a comprehensive answer to the question
+            3. Reference specific files, functions, or code sections when relevant
+            4. Include code examples or snippets if helpful
+            5. Write your detailed response to a file called 'codebase_analysis_response.md'
+            6. Keep your response informative and actionable
+
+            Focus on providing accurate, detailed analysis based on the actual codebase content.
+
+      - name: Save Claude analysis output
+        run: |
+          echo "✅ Analysis completed with Claude Code action"
+          # The Claude Code action will have already made any necessary changes
+          # Check if Claude created the response file
+          if [ -f "codebase_analysis_response.md" ]; then
+            RESPONSE_SIZE=$(wc -c < codebase_analysis_response.md)
+            if [ "$RESPONSE_SIZE" -gt 100 ]; then
+              echo "✅ Analysis response file created successfully ($RESPONSE_SIZE bytes)"
+            else
+              echo "⚠️ Response file exists but is very small ($RESPONSE_SIZE bytes)"
+              echo "File contents:"
+              cat codebase_analysis_response.md
+            fi
+          else
+            echo "⚠️ No response file created, generating fallback summary"
+            cat > codebase_analysis_response.md << 'EOF'
+          # Codebase Analysis Results
+
+          **Question:** ${{ github.event.inputs.question }}
+          **Repository:** ${{ github.repository }}
+          **Framework:** ${{ env.FRAMEWORK }}
+          **Date:** $(date)
+
+          ⚠️ **Notice:** Claude Code action completed but no analysis file was generated. 
+          This may indicate a permission issue or other technical problem.
+          
+          Please check the Claude Code action logs above for detailed analysis output.
+          EOF
+          fi
+
+      - name: Create analysis payload
+        run: |
+          echo "📦 Creating analysis payload..."
+          
+          # Read the analysis response
+          ANALYSIS=$(cat codebase_analysis_response.md)
+
+          # Create payload for VGit
+          cat > analysis_payload.json << EOF
+          {
+            "question": "${{ github.event.inputs.question }}",
+            "repository_full_name": "${{ github.repository }}",
+            "context_node": "${{ github.event.inputs.context_node }}",
+            "framework": "${{ env.FRAMEWORK }}",
+            "analysis": $(echo "$ANALYSIS" | jq -Rs .),
+            "workflow_run_id": "${{ github.run_id }}",
+            "commit_sha": "${{ github.sha }}",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+          }
+          EOF
+
+          echo "✅ Analysis payload created"
+
+      - name: Upload analysis as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codebase-analysis
+          path: |
+            codebase_analysis_response.md
+            analysis_payload.json
+            analysis_context/
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "🎉 Codebase analysis completed successfully!"
+          echo ""
+          echo "📋 Summary:"
+          echo "- Question: ${{ github.event.inputs.question }}"
+          echo "- Repository: ${{ github.repository }}"
+          echo "- Framework: ${{ env.FRAMEWORK }}"
+          echo "- Analysis length: $(wc -w < codebase_analysis_response.md) words"
+          echo "- Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "🔍 To view the full analysis, check the uploaded artifacts in this workflow run."

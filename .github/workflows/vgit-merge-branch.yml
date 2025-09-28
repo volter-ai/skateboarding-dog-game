@@ -1,0 +1,465 @@
+name: VGit Merge Branch
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to merge from'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch to merge into'
+        required: true
+        type: string
+      username:
+        description: 'GitHub username'
+        required: true
+        type: string
+      project_name:
+        description: 'Project name'
+        required: true
+        type: string
+      merge_strategy:
+        description: 'Merge strategy'
+        required: false
+        type: choice
+        default: 'merge'
+        options:
+          - 'merge'
+          - 'squash'
+          - 'rebase'
+
+jobs:
+  merge-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.source_branch }}" ]; then
+            echo "❌ Source branch is required"
+            exit 1
+          fi
+          if [ -z "${{ github.event.inputs.target_branch }}" ]; then
+            echo "❌ Target branch is required"
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.source_branch }}" = "${{ github.event.inputs.target_branch }}" ]; then
+            echo "❌ Source and target branches cannot be the same"
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+          echo "Source: ${{ github.event.inputs.source_branch }}"
+          echo "Target: ${{ github.event.inputs.target_branch }}"
+          echo "Strategy: ${{ github.event.inputs.merge_strategy }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.event.inputs.username }}"
+          git config --global user.email "${{ github.event.inputs.username }}@users.noreply.github.com"
+
+      - name: Verify branches exist
+        run: |
+          echo "🔍 Verifying branches exist..."
+          
+          # Check if source branch exists
+          if ! git ls-remote --heads origin "${{ github.event.inputs.source_branch }}" | grep -q "${{ github.event.inputs.source_branch }}"; then
+            echo "❌ Source branch '${{ github.event.inputs.source_branch }}' does not exist"
+            exit 1
+          fi
+          echo "✅ Source branch exists: ${{ github.event.inputs.source_branch }}"
+          
+          # Check if target branch exists
+          if ! git ls-remote --heads origin "${{ github.event.inputs.target_branch }}" | grep -q "${{ github.event.inputs.target_branch }}"; then
+            echo "❌ Target branch '${{ github.event.inputs.target_branch }}' does not exist"
+            exit 1
+          fi
+          echo "✅ Target branch exists: ${{ github.event.inputs.target_branch }}"
+
+      - name: Fetch and prepare branches
+        run: |
+          echo "📥 Fetching and preparing branches..."
+          
+          # Fetch all branches
+          git fetch origin
+          
+          # Checkout target branch
+          git checkout "${{ github.event.inputs.target_branch }}"
+          git pull origin "${{ github.event.inputs.target_branch }}"
+          
+          # Get branch information
+          TARGET_COMMIT=$(git rev-parse HEAD)
+          SOURCE_COMMIT=$(git rev-parse "origin/${{ github.event.inputs.source_branch }}")
+          
+          echo "Target branch commit: $TARGET_COMMIT"
+          echo "Source branch commit: $SOURCE_COMMIT"
+          
+          # Store for later use
+          echo "TARGET_COMMIT=$TARGET_COMMIT" >> $GITHUB_ENV
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> $GITHUB_ENV
+
+      - name: Check for merge conflicts
+        run: |
+          echo "🔍 Checking for potential merge conflicts..."
+          
+          # Create a temporary merge to check for conflicts
+          git merge origin/${{ github.event.inputs.source_branch }} --no-commit --no-ff || {
+            echo "⚠️ Merge conflicts detected"
+            
+            # Get list of conflicted files
+            CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files:"
+            echo "$CONFLICTED_FILES"
+            
+            # Abort the merge attempt
+            git merge --abort
+            
+            # Create conflict report
+            echo "MERGE_CONFLICTS=true" >> $GITHUB_ENV
+            echo "$CONFLICTED_FILES" > conflicted_files.txt
+            
+            echo "❌ Cannot proceed with merge due to conflicts"
+            echo "The following files have conflicts:"
+            echo "$CONFLICTED_FILES"
+            exit 1
+          }
+          
+          # Abort the test merge
+          git merge --abort
+          echo "✅ No merge conflicts detected"
+          echo "MERGE_CONFLICTS=false" >> $GITHUB_ENV
+
+      - name: Setup Node.js (if needed)
+        if: env.MERGE_CONFLICTS == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies and run pre-merge checks
+        if: env.MERGE_CONFLICTS == 'false'
+        run: |
+          echo "🔧 Running pre-merge checks..."
+          
+          if [ -f "package.json" ]; then
+            echo "📦 Installing dependencies..."
+            npm install
+            
+            # Run linting if available
+            if npm run lint --silent > /dev/null 2>&1; then
+              echo "🔍 Running linter on target branch..."
+              npm run lint || {
+                echo "⚠️ Linting issues found on target branch"
+                echo "LINT_ISSUES=true" >> $GITHUB_ENV
+              }
+            fi
+            
+            # Run tests if available
+            if npm run test --silent > /dev/null 2>&1; then
+              echo "🧪 Running tests on target branch..."
+              npm test || {
+                echo "⚠️ Tests failing on target branch"
+                echo "TEST_FAILURES=true" >> $GITHUB_ENV
+              }
+            fi
+          else
+            echo "ℹ️ No package.json found, skipping dependency checks"
+          fi
+
+      - name: Perform merge
+        if: env.MERGE_CONFLICTS == 'false'
+        run: |
+          echo "🔀 Performing merge: ${{ github.event.inputs.source_branch }} → ${{ github.event.inputs.target_branch }}"
+          
+          case "${{ github.event.inputs.merge_strategy }}" in
+            "squash")
+              echo "📦 Using squash merge strategy..."
+              git merge origin/${{ github.event.inputs.source_branch }} --squash
+              
+              # Create commit message for squash merge
+              COMMIT_MSG="Merge branch '${{ github.event.inputs.source_branch }}' into ${{ github.event.inputs.target_branch }}
+
+          🤖 Squash merge performed by VGit AI
+          
+          Source: ${{ github.event.inputs.source_branch }} (${{ env.SOURCE_COMMIT }})
+          Target: ${{ github.event.inputs.target_branch }} (${{ env.TARGET_COMMIT }})
+          Requested by: ${{ github.event.inputs.username }}
+          
+          Co-Authored-By: VGit AI <ai@vgit.app>"
+              
+              git commit -m "$COMMIT_MSG"
+              ;;
+              
+            "rebase")
+              echo "📚 Using rebase merge strategy..."
+              # Checkout source branch and rebase onto target
+              git checkout origin/${{ github.event.inputs.source_branch }}
+              git rebase origin/${{ github.event.inputs.target_branch }}
+              
+              # Fast-forward merge target branch
+              git checkout ${{ github.event.inputs.target_branch }}
+              git merge --ff-only origin/${{ github.event.inputs.source_branch }}
+              ;;
+              
+            *)
+              echo "🔀 Using standard merge strategy..."
+              git merge origin/${{ github.event.inputs.source_branch }} --no-ff -m "Merge branch '${{ github.event.inputs.source_branch }}' into ${{ github.event.inputs.target_branch }}
+
+          🤖 Merge performed by VGit AI
+          
+          Source: ${{ github.event.inputs.source_branch }} (${{ env.SOURCE_COMMIT }})
+          Target: ${{ github.event.inputs.target_branch }} (${{ env.TARGET_COMMIT }})
+          Requested by: ${{ github.event.inputs.username }}
+          
+          Co-Authored-By: VGit AI <ai@vgit.app>"
+              ;;
+          esac
+          
+          echo "✅ Merge completed successfully"
+          
+          # Get the merge commit SHA
+          MERGE_COMMIT=$(git rev-parse HEAD)
+          echo "Merge commit: $MERGE_COMMIT"
+          echo "MERGE_COMMIT=$MERGE_COMMIT" >> $GITHUB_ENV
+
+      - name: Run post-merge validation
+        if: env.MERGE_CONFLICTS == 'false'
+        run: |
+          echo "✅ Running post-merge validation..."
+          
+          if [ -f "package.json" ]; then
+            # Run linting on merged code
+            if npm run lint --silent > /dev/null 2>&1; then
+              echo "🔍 Running linter on merged code..."
+              npm run lint || {
+                echo "❌ Linting failed after merge"
+                echo "POST_MERGE_LINT_FAILED=true" >> $GITHUB_ENV
+              }
+            fi
+            
+            # Run tests on merged code
+            if npm run test --silent > /dev/null 2>&1; then
+              echo "🧪 Running tests on merged code..."
+              npm test || {
+                echo "❌ Tests failed after merge"
+                echo "POST_MERGE_TEST_FAILED=true" >> $GITHUB_ENV
+              }
+            fi
+          fi
+          
+          echo "✅ Post-merge validation completed"
+
+      - name: Push merged changes
+        if: env.MERGE_CONFLICTS == 'false' && env.POST_MERGE_LINT_FAILED != 'true' && env.POST_MERGE_TEST_FAILED != 'true'
+        run: |
+          echo "🚀 Pushing merged changes..."
+          git push origin ${{ github.event.inputs.target_branch }} || {
+            echo "❌ Failed to push merged changes"
+            exit 1
+          }
+          echo "✅ Merged changes pushed successfully"
+
+      - name: Create deployment preview (if applicable)
+        if: env.MERGE_CONFLICTS == 'false' && env.POST_MERGE_LINT_FAILED != 'true' && env.POST_MERGE_TEST_FAILED != 'true'
+        run: |
+          echo "🌐 Creating post-merge deployment preview..."
+          
+          if [ -f "package.json" ] && (grep -q '"build"' package.json || grep -q '"dev"' package.json); then
+            echo "📦 Web project detected, attempting preview deployment..."
+            
+            # Build the project
+            if grep -q '"build"' package.json; then
+              npm run build && {
+                echo "PREVIEW_BUILD_SUCCESS=true" >> $GITHUB_ENV
+                echo "✅ Build successful"
+              } || {
+                echo "⚠️ Build failed, skipping preview deployment"
+                echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+              }
+            else
+              echo "ℹ️ No build script found, skipping preview"
+              echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "ℹ️ Not a web project, skipping preview deployment"
+            echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Detect build output directory
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        run: |
+          echo "📁 Detecting build output directory..."
+          
+          # Check for custom build directory from secret first
+          if [ -n "${{ secrets.CUSTOM_BUILD_DIR }}" ]; then
+            CUSTOM_DIR="${{ secrets.CUSTOM_BUILD_DIR }}"
+            if [ -d "$CUSTOM_DIR" ] && [ "$(ls -A $CUSTOM_DIR 2>/dev/null)" ]; then
+              echo "BUILD_DIR=$CUSTOM_DIR" >> $GITHUB_ENV
+              echo "✅ Using custom build directory: $CUSTOM_DIR"
+              ls -la "$CUSTOM_DIR"
+              exit 0
+            else
+              echo "⚠️ Custom build directory '$CUSTOM_DIR' not found or empty, falling back to auto-detection"
+            fi
+          fi
+          
+          # Auto-detect common build output directories
+          BUILD_DIRS=("dist" "build" "_site" "out" ".next" "public")
+          
+          for dir in "${BUILD_DIRS[@]}"; do
+            if [ -d "$dir" ] && [ "$(ls -A $dir 2>/dev/null)" ]; then
+              echo "BUILD_DIR=$dir" >> $GITHUB_ENV
+              echo "✅ Build output directory found: $dir"
+              break
+            fi
+          done
+          
+          # If no build directory found, use current directory for static sites
+          if [ -z "${BUILD_DIR:-}" ]; then
+            if [ -f "index.html" ]; then
+              echo "BUILD_DIR=." >> $GITHUB_ENV
+              echo "✅ Using current directory for static site"
+            else
+              echo "❌ No build output directory found"
+              echo "Available directories:"
+              ls -la
+              exit 1
+            fi
+          fi
+          
+          # List contents of chosen build directory
+          echo "📄 Build directory contents:"
+          ls -la "${BUILD_DIR}"
+
+      - name: Install Netlify CLI
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        run: |
+          echo "🌐 Installing Netlify CLI..."
+          npm install -g netlify-cli
+          netlify --version
+
+      - name: Deploy to Netlify (if build succeeded)
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: |
+          if [ -n "$NETLIFY_AUTH_TOKEN" ] && [ -n "$NETLIFY_SITE_ID" ]; then
+            echo "🚀 Deploying merged changes to Netlify..."
+            
+            # Deploy to Netlify production (since this is a merge to main branch)
+            DEPLOY_OUTPUT=$(netlify deploy --dir="${BUILD_DIR}" --prod --json) || {
+              echo "⚠️ Netlify deployment failed, continuing..."
+              exit 0
+            }
+            
+            # Extract deployment URL
+            DEPLOY_URL=$(echo "$DEPLOY_OUTPUT" | jq -r '.url // empty')
+            if [ -n "$DEPLOY_URL" ]; then
+              echo "✅ Deployment successful: $DEPLOY_URL"
+              echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_ENV
+            fi
+          else
+            echo "ℹ️ Netlify credentials not configured, skipping deployment"
+          fi
+
+      - name: Create merge payload
+        if: env.MERGE_CONFLICTS == 'false'
+        run: |
+          echo "📦 Creating merge result payload..."
+          
+          # Create payload for VGit
+          cat > merge_payload.json << EOF
+          {
+            "source_branch": "${{ github.event.inputs.source_branch }}",
+            "target_branch": "${{ github.event.inputs.target_branch }}",
+            "merge_strategy": "${{ github.event.inputs.merge_strategy }}",
+            "repository_full_name": "${{ github.repository }}",
+            "username": "${{ github.event.inputs.username }}",
+            "project_name": "${{ github.event.inputs.project_name }}",
+            "source_commit": "${{ env.SOURCE_COMMIT }}",
+            "target_commit": "${{ env.TARGET_COMMIT }}",
+            "merge_commit": "${{ env.MERGE_COMMIT }}",
+            "deploy_url": "${{ env.DEPLOY_URL }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "merge_successful": true,
+            "lint_passed": "${{ env.POST_MERGE_LINT_FAILED != 'true' }}",
+            "tests_passed": "${{ env.POST_MERGE_TEST_FAILED != 'true' }}",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+          }
+          EOF
+          
+          echo "✅ Merge payload created"
+
+      - name: Create conflict payload (if conflicts occurred)
+        if: env.MERGE_CONFLICTS == 'true'
+        run: |
+          echo "📦 Creating conflict payload..."
+          
+          # Read conflicted files
+          CONFLICTED_FILES="[]"
+          if [ -f "conflicted_files.txt" ]; then
+            CONFLICTED_FILES=$(jq -R -s -c 'split("\n") | map(select(length > 0))' < conflicted_files.txt)
+          fi
+          
+          # Create conflict payload
+          cat > merge_payload.json << EOF
+          {
+            "source_branch": "${{ github.event.inputs.source_branch }}",
+            "target_branch": "${{ github.event.inputs.target_branch }}",
+            "repository_full_name": "${{ github.repository }}",
+            "username": "${{ github.event.inputs.username }}",
+            "project_name": "${{ github.event.inputs.project_name }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "merge_successful": false,
+            "conflict_reason": "merge_conflicts",
+            "conflicted_files": $CONFLICTED_FILES,
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+          }
+          EOF
+
+      - name: Upload merge results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-results
+          path: |
+            merge_payload.json
+            conflicted_files.txt
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          if [ "${{ env.MERGE_CONFLICTS }}" = "true" ]; then
+            echo "❌ Merge failed due to conflicts!"
+            echo ""
+            echo "📋 Conflict Summary:"
+            echo "- Source: ${{ github.event.inputs.source_branch }}"
+            echo "- Target: ${{ github.event.inputs.target_branch }}"
+            echo "- Repository: ${{ github.repository }}"
+            echo "- Conflicted files: See conflicted_files.txt artifact"
+            echo "- Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo "🔧 To resolve conflicts:"
+            echo "1. Manually merge the branches locally"
+            echo "2. Resolve the conflicts in the listed files"
+            echo "3. Push the resolved changes"
+          else
+            echo "🎉 Merge completed successfully!"
+            echo ""
+            echo "📋 Summary:"
+            echo "- Source: ${{ github.event.inputs.source_branch }}"
+            echo "- Target: ${{ github.event.inputs.target_branch }}"
+            echo "- Strategy: ${{ github.event.inputs.merge_strategy }}"
+            echo "- Repository: ${{ github.repository }}"
+            echo "- Merge Commit: ${{ env.MERGE_COMMIT }}"
+            if [ -n "${{ env.DEPLOY_URL }}" ]; then
+              echo "- Deployment URL: ${{ env.DEPLOY_URL }}"
+            fi
+            echo "- Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
