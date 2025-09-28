@@ -1,0 +1,1 @@
+Basic skateboarding dog implementation using emojis and CSS animations. The dog moves back and forth across the screen on a skateboard.

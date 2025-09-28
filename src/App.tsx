@@ -1,34 +1,31 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
+import { useState, useEffect } from 'react'
 import './App.css'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [position, setPosition] = useState(0)
+  const [direction, setDirection] = useState(1)
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPosition((pos) => {
+        if (pos > 80) setDirection(-1)
+        if (pos < 0) setDirection(1)
+        return pos + direction * 2
+      })
+    }, 50)
+    return () => clearInterval(interval)
+  }, [direction])
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <div className="skateboarding-container">
+      <div 
+        className="dog-container"
+        style={{ left: `${position}%` }}
+      >
+        <div className="dog">🐕</div>
+        <div className="skateboard">🛹</div>
       </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+    </div>
   )
 }
 
