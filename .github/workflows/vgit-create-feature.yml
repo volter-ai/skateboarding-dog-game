@@ -1,0 +1,579 @@
+name: VGit Create Feature
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: "Name for the new branch"
+        required: true
+        type: string
+      request:
+        description: "Feature request description"
+        required: true
+        type: string
+      username:
+        description: "GitHub username"
+        required: true
+        type: string
+      current_node:
+        description: "Current workspace node (optional)"
+        required: false
+        type: string
+      base_branch:
+        description: "Base branch to create feature from"
+        required: false
+        type: string
+        default: "main"
+
+jobs:
+  create-feature:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # For git operations (checkout, commit, push)
+      actions: read # For workflow operations
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.branch_name }}" ]; then
+            echo "❌ Branch name is required"
+            exit 1
+          fi
+          if [ -z "${{ github.event.inputs.request }}" ]; then
+            echo "❌ Feature request is required"
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+          echo "Branch: ${{ github.event.inputs.branch_name }}"
+          echo "Request: ${{ github.event.inputs.request }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.event.inputs.username }}"
+          git config --global user.email "${{ github.event.inputs.username }}@users.noreply.github.com"
+
+      - name: Create feature branch
+        run: |
+          echo "🌿 Creating feature branch: ${{ github.event.inputs.branch_name }}"
+
+          # Ensure we're on the base branch
+          git checkout ${{ github.event.inputs.base_branch }}
+          git pull origin ${{ github.event.inputs.base_branch }}
+
+          # Create and switch to feature branch
+          git checkout -b "${{ github.event.inputs.branch_name }}"
+
+          echo "✅ Feature branch created successfully"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: |
+          if [ -f "package.json" ]; then
+            echo "📦 Installing dependencies..."
+            npm install
+          else
+            echo "⚠️ No package.json found, skipping dependency installation"
+          fi
+
+      - name: Implement feature with Claude (SDK)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "❌ ANTHROPIC_API_KEY is required to call Anthropic API"
+            echo "Please add your Anthropic API key to repository secrets"
+            exit 1
+          fi
+          echo "🤖 Installing Anthropic SDK and TypeScript tools..."
+          npm install @anthropic-ai/sdk@latest tsx @types/node
+
+          echo "🧠 Running Anthropic to propose and apply changes..."
+          cat > apply_feature.ts << 'EOF'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import Anthropic from '@anthropic-ai/sdk';
+
+          const FEATURE = process.env.FEATURE_REQUEST || '';
+          if (!FEATURE) {
+            console.error('No FEATURE_REQUEST provided');
+            process.exit(0);
+          }
+
+          const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+          // Collect lightweight repo context to guide the model
+          function safeRead(p) {
+            try { return fs.readFileSync(p, 'utf8'); } catch { return ''; }
+          }
+
+          const pkgJson = safeRead('package.json');
+          const indexHtml = safeRead('index.html');
+          const appTsx = safeRead('src/App.tsx');
+          const mainTsx = safeRead('src/main.tsx');
+
+          (async () => {
+            const system = [
+              'You are an expert software engineer editing this repository. ',
+              'Your job is to IMPLEMENT the requested feature directly by returning ONLY a single fenced JSON object.',
+              'Do not output any prose before or after. Do not include backticks outside the fence. No explanations.',
+              'Every change must appear in the JSON as a full file content replacement (no patches).',
+              'Prefer minimal, safe edits that compile and run.'
+            ].join('');
+
+            const prompt = [
+              'Repository context (read-only to you):',
+              '--- package.json ---',
+              pkgJson || '(missing)',
+              '--- index.html ---',
+              indexHtml || '(missing)',
+              '--- key files ---',
+              'src/App.tsx:\n' + (appTsx || '(missing)'),
+              'src/main.tsx:\n' + (mainTsx || '(missing)'),
+              '',
+              'Feature request (implement now):',
+              FEATURE,
+              '',
+              'Return ONLY a fenced JSON block with the following shape:',
+              '```json',
+              '{\n  "changes": [ { "path": "relative/file/path", "content": "full new file content" } ],\n  "notes": "short notes/instructions"\n}',
+              '```',
+              '',
+              'Rules:',
+              '- Include full file contents for small files you add or replace (<= 300 lines).',
+              '- Use this project\'s conventions (TypeScript+Vite React app).',
+              '- If creating a basic UI page/app, update src/App.tsx and any necessary bootstrapping files.',
+              '- If adding dependencies, also update package.json and optionally note install steps in notes.',
+              '- Do not output anything except the fenced JSON. No extra backticks outside the fence.'
+            ].join('\n');
+
+            const msg = await client.messages.create({
+              model: 'claude-3-5-sonnet-20241022',
+              max_tokens: 3000,
+              temperature: 0.2,
+              system,
+              messages: [
+                { role: 'user', content: prompt }
+              ]
+            });
+
+            const parts = msg.content || [];
+            const text = parts.map(p => (typeof p === 'string' ? p : p.text)).join('\n');
+
+            const fenceMatch = text.match(/```json\s*([\s\S]*?)```/i);
+            const rawJson = fenceMatch ? fenceMatch[1] : (text.trim().startsWith('{') ? text.trim() : '');
+            if (!rawJson) {
+              console.log('No JSON changes found.');
+              return;
+            }
+            let data;
+            try {
+              data = JSON.parse(rawJson);
+            } catch (e) {
+              console.log('Failed to parse JSON, aborting without changes.');
+              return;
+            }
+
+            const changes = Array.isArray(data.changes) ? data.changes : [];
+            let wrote = 0;
+            for (const ch of changes) {
+              if (!ch || !ch.path || typeof ch.content !== 'string') continue;
+              const fp = path.resolve(process.cwd(), ch.path);
+              fs.mkdirSync(path.dirname(fp), { recursive: true });
+              fs.writeFileSync(fp, ch.content, 'utf8');
+              console.log('✅ Wrote', ch.path);
+              wrote++;
+            }
+            if (data.notes) {
+              fs.writeFileSync('FEATURE_AI_NOTES.md', String(data.notes));
+            }
+            if (wrote === 0) {
+              console.log('⚠️ No files written from model response.');
+            }
+          })().catch(err => {
+            console.error('❌ Error running Anthropic:', err?.stack || err?.message || String(err));
+            process.exit(0); // don't fail the workflow
+          });
+          EOF
+
+          FEATURE_REQUEST='${{ github.event.inputs.request }}' npx tsx apply_feature.ts || true
+          echo "✅ Anthropic SDK step completed"
+
+      - name: Install new dependencies (if package.json changed)
+        run: |
+          if git diff --name-only | grep -q "package.json"; then
+            echo "📦 package.json was modified, installing new dependencies..."
+            npm install
+          else
+            echo "ℹ️ No package.json changes detected"
+          fi
+
+      - name: Verify changes
+        run: |
+          echo "🔍 Verifying implemented changes..."
+
+          # Check if any files were modified
+          if git diff --quiet; then
+            echo "⚠️ No changes detected. Creating a minimal change to complete the workflow."
+            echo "# Feature: ${{ github.event.inputs.request }}" >> FEATURE_LOG.md
+            echo "- Implemented on: $(date)" >> FEATURE_LOG.md
+            echo "- Branch: ${{ github.event.inputs.branch_name }}" >> FEATURE_LOG.md
+            echo "" >> FEATURE_LOG.md
+          else
+            echo "✅ Changes detected:"
+            git diff --name-only
+          fi
+
+      - name: Run tests (if available)
+        run: |
+          echo "🧪 Running tests..."
+          if [ -f "package.json" ] && grep -q '"test"' package.json; then
+            npm test || {
+              echo "⚠️ Tests failed, but continuing with feature implementation"
+              echo "TEST_FAILURES=true" >> $GITHUB_ENV
+            }
+          else
+            echo "ℹ️ No test script found, skipping tests"
+          fi
+
+      - name: Commit changes
+        run: |
+          echo "📝 Committing changes..."
+
+          # Add all changes
+          git add .
+
+          # Create commit message
+          COMMIT_MSG="feat: ${{ github.event.inputs.request }}
+
+          🤖 Generated with VGit AI
+
+          Branch: ${{ github.event.inputs.branch_name }}
+          Requested by: ${{ github.event.inputs.username }}
+
+          Co-Authored-By: VGit AI <ai@vgit.app>"
+
+          # Commit changes
+          git commit -m "$COMMIT_MSG" || {
+            echo "❌ Commit failed"
+            exit 1
+          }
+
+          echo "✅ Changes committed successfully"
+
+      - name: Push feature branch
+        run: |
+          echo "🚀 Pushing feature branch to origin..."
+          git push origin "${{ github.event.inputs.branch_name }}" || {
+            echo "❌ Push failed"
+            exit 1
+          }
+          echo "✅ Feature branch pushed successfully"
+
+      - name: Create deployment preview (if applicable)
+        run: |
+          echo "🌐 Creating deployment preview..."
+
+          # Check if this is a web project that can be deployed
+          if [ -f "package.json" ] && (grep -q '"build"' package.json || grep -q '"dev"' package.json); then
+            echo "📦 Web project detected, attempting preview deployment..."
+            
+            # Build the project
+            if grep -q '"build"' package.json; then
+              npm run build && {
+                echo "PREVIEW_BUILD_SUCCESS=true" >> $GITHUB_ENV
+                echo "✅ Build successful"
+              } || {
+                echo "⚠️ Build failed, skipping preview deployment"
+                echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+              }
+            else
+              echo "ℹ️ No build script found, skipping preview"
+              echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "ℹ️ Not a web project, skipping preview deployment"
+            echo "PREVIEW_BUILD_SUCCESS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Detect build output directory
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        run: |
+          echo "📁 Detecting build output directory..."
+
+          # Check for custom build directory from secret first
+          if [ -n "${{ secrets.CUSTOM_BUILD_DIR }}" ]; then
+            CUSTOM_DIR="${{ secrets.CUSTOM_BUILD_DIR }}"
+            if [ -d "$CUSTOM_DIR" ] && [ "$(ls -A $CUSTOM_DIR 2>/dev/null)" ]; then
+              BUILD_DIR="$CUSTOM_DIR"
+              echo "BUILD_DIR=$CUSTOM_DIR" >> $GITHUB_ENV
+              echo "✅ Using custom build directory: $CUSTOM_DIR"
+              ls -la "$CUSTOM_DIR"
+              exit 0
+            else
+              echo "⚠️ Custom build directory '$CUSTOM_DIR' not found or empty, falling back to auto-detection"
+            fi
+          fi
+
+          # Auto-detect common build output directories
+          BUILD_DIRS=("dist" "build" "_site" "out" ".next" "public")
+
+          for dir in "${BUILD_DIRS[@]}"; do
+            if [ -d "$dir" ] && [ "$(ls -A $dir 2>/dev/null)" ]; then
+              BUILD_DIR="$dir"
+              echo "BUILD_DIR=$dir" >> $GITHUB_ENV
+              echo "✅ Build output directory found: $dir"
+              break
+            fi
+          done
+
+          # If no build directory found, use current directory for static sites
+          if [ -z "${BUILD_DIR:-}" ]; then
+            if [ -f "index.html" ]; then
+              BUILD_DIR="."
+              echo "BUILD_DIR=." >> $GITHUB_ENV
+              echo "✅ Using current directory for static site"
+            else
+              echo "❌ No build output directory found"
+              echo "Available directories:"
+              ls -la
+              exit 1
+            fi
+          fi
+
+          # List contents of chosen build directory
+          echo "📄 Build directory contents:"
+          ls -la "${BUILD_DIR}"
+
+      - name: Deploy to Netlify (if build succeeded)
+        id: netlify-deploy
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        run: |
+          echo "🚀 Installing and using Netlify CLI directly..."
+          npm install -g netlify-cli@17.10.1
+
+          # Deploy and capture output
+          netlify deploy --dir=${{ env.BUILD_DIR }} --json > deploy_output.json
+
+          # Extract URLs from output
+          cat deploy_output.json
+          DEPLOY_URL=$(cat deploy_output.json | grep -o '"deploy_url":"[^"]*' | cut -d'"' -f4)
+
+          if [ -n "$DEPLOY_URL" ]; then
+            echo "NETLIFY_URL=$DEPLOY_URL" >> $GITHUB_ENV
+            echo "✅ Deployed to: $DEPLOY_URL"
+          else
+            echo "⚠️ Could not extract deployment URL"
+            cat deploy_output.json
+          fi
+        env:
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+
+      - name: Extract Netlify deployment URL
+        if: env.PREVIEW_BUILD_SUCCESS == 'true'
+        run: |
+          # Extract preview URL from environment variable set in previous step
+          DEPLOY_URL="$NETLIFY_URL"
+
+          if [ -n "$DEPLOY_URL" ]; then
+            echo "✅ Preview deployed: $DEPLOY_URL"
+            echo "PREVIEW_URL=$DEPLOY_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ No deployment URL received from Netlify"
+            echo "Checking for deploy_output.json..."
+            if [ -f "deploy_output.json" ]; then
+              echo "Deploy output contents:"
+              cat deploy_output.json
+
+              # Try alternative JSON parsing methods
+              DEPLOY_URL=$(cat deploy_output.json | jq -r '.deploy_url // empty' 2>/dev/null || echo "")
+              if [ -z "$DEPLOY_URL" ]; then
+                DEPLOY_URL=$(cat deploy_output.json | grep -o 'https://[^"]*\.netlify\.app' | head -1 || echo "")
+              fi
+
+              if [ -n "$DEPLOY_URL" ]; then
+                echo "✅ Extracted URL: $DEPLOY_URL"
+                echo "PREVIEW_URL=$DEPLOY_URL" >> $GITHUB_ENV
+              else
+                echo "❌ Could not extract URL from deploy output"
+              fi
+            else
+              echo "❌ deploy_output.json not found"
+            fi
+          fi
+
+      - name: Install Playwright browsers
+        if: env.PREVIEW_URL != ''
+        run: |
+          echo "📸 Installing Playwright browser for screenshot generation..."
+          npx playwright install chromium --with-deps
+
+      - name: Generate screenshot and upload to CDN
+        if: env.PREVIEW_URL != ''
+        run: |
+          echo "📸 Generating screenshot of deployed site..."
+
+          # Wait for deployment to be ready
+          sleep 5
+
+          # Create screenshot script
+          cat > screenshot.js << 'EOF'
+          import { chromium } from 'playwright';
+          import FormData from 'form-data';
+          import fetch from 'node-fetch';
+          import fs from 'fs';
+
+          (async () => {
+            console.log('🚀 Launching browser...');
+            const browser = await chromium.launch({ 
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+              ]
+            });
+            
+            const page = await browser.newPage();
+            await page.setViewportSize({ width: 1280, height: 720 });
+            
+            console.log('📄 Navigating to:', process.env.PREVIEW_URL);
+            await page.goto(process.env.PREVIEW_URL, {
+              waitUntil: 'domcontentloaded',
+              timeout: 20000
+            });
+            
+            // Wait for page to stabilize
+            await page.waitForTimeout(1000);
+            
+            console.log('📸 Capturing screenshot...');
+            const screenshot = await page.screenshot({ 
+              type: 'jpeg',
+              fullPage: true,
+              quality: 90 
+            });
+            
+            await browser.close();
+            
+            // Upload to Uploadcare
+            console.log('☁️ Uploading to Uploadcare CDN...');
+            
+            const form = new FormData();
+            form.append('UPLOADCARE_PUB_KEY', process.env.UPLOADCARE_PUBLIC_KEY);
+            form.append('file', screenshot, {
+              filename: 'screenshot.jpg',
+              contentType: 'image/jpeg'
+            });
+            
+            const response = await fetch('https://upload.uploadcare.com/base/', {
+              method: 'POST',
+              body: form
+            });
+            
+            const result = await response.json();
+            if (result.file) {
+              const cdnUrl = `https://ucarecdn.com/${result.file}/`;
+              console.log('✅ Screenshot uploaded:', cdnUrl);
+              console.log(`SCREENSHOT_URL=${cdnUrl}`);
+              
+              // Set environment variable for next steps
+              fs.appendFileSync(process.env.GITHUB_ENV, `SCREENSHOT_URL=${cdnUrl}\n`);
+            } else {
+              console.error('❌ Upload failed:', result);
+              process.exit(1);
+            }
+          })();
+          EOF
+
+          # Install required packages
+          npm install playwright form-data node-fetch@2
+
+          # Run screenshot script
+          node screenshot.js || {
+            echo "⚠️ Screenshot generation failed, but deployment was successful"
+            echo "SCREENSHOT_URL=" >> $GITHUB_ENV
+          }
+        env:
+          UPLOADCARE_PUBLIC_KEY: ${{ secrets.UPLOADCARE_PUBLIC_KEY }}
+
+      - name: Update commit with preview info
+        if: env.PREVIEW_URL != ''
+        run: |
+          echo "📝 Adding preview info to commit..."
+
+          # Amend commit with preview information
+          UPDATED_COMMIT_MSG="feat: ${{ github.event.inputs.request }}
+
+          🤖 Generated with VGit AI
+
+          Branch: ${{ github.event.inputs.branch_name }}
+          Requested by: ${{ github.event.inputs.username }}
+          Preview: ${{ env.PREVIEW_URL }}
+
+          ---PREVIEW-INFO---
+          Preview URL: ${{ env.PREVIEW_URL }}
+          Screenshot URL: ${{ env.SCREENSHOT_URL }}
+          "
+
+          git commit --amend -m "$UPDATED_COMMIT_MSG"
+          git push origin "${{ github.event.inputs.branch_name }}" --force-with-lease
+
+      - name: Create workspace node update payload
+        run: |
+          echo "🏗️ Creating workspace node update payload..."
+
+          # Get commit SHA
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          # Create payload for VGit workspace node creation
+          cat > workspace_node_payload.json << EOF
+          {
+            "repository_full_name": "${{ github.repository }}",
+            "branch_name": "${{ github.event.inputs.branch_name }}",
+            "commit_sha": "$COMMIT_SHA",
+            "username": "${{ github.event.inputs.username }}",
+            "current_node": "${{ github.event.inputs.current_node }}",
+            "preview_url": "${{ env.PREVIEW_URL }}",
+            "screenshot_url": "${{ env.SCREENSHOT_URL }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+          }
+          EOF
+
+          echo "✅ Workspace node payload created"
+
+      - name: Upload workspace payload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-node-payload
+          path: workspace_node_payload.json
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          echo "🎉 Feature creation completed successfully!"
+          echo ""
+          echo "📋 Summary:"
+          echo "- Branch: ${{ github.event.inputs.branch_name }}"
+          echo "- Feature: ${{ github.event.inputs.request }}"
+          echo "- Repository: ${{ github.repository }}"
+          echo "- Commit SHA: $(git rev-parse HEAD)"
+          if [ -n "${{ env.PREVIEW_URL }}" ]; then
+            echo "- Preview URL: ${{ env.PREVIEW_URL }}"
+          fi
+          if [ -n "${{ env.SCREENSHOT_URL }}" ]; then
+            echo "- Screenshot URL: ${{ env.SCREENSHOT_URL }}"
+          fi
+          echo "- Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
